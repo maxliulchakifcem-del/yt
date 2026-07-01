@@ -289,6 +289,7 @@ app.get("/api/playlist-info", async (req, res) => {
 
     const data = JSON.parse(jsonMatch[1]);
     const videos: any[] = [];
+    const addedIds = new Set<string>();
 
     function searchVideos(obj: any) {
       if (!obj || typeof obj !== "object") return;
@@ -296,7 +297,7 @@ app.get("/api/playlist-info", async (req, res) => {
       if (obj.playlistVideoRenderer) {
         const v = obj.playlistVideoRenderer;
         const videoId = v.videoId;
-        if (!videoId) return;
+        if (!videoId || addedIds.has(videoId)) return;
 
         let title = "Unknown Track";
         if (v.title?.runs?.[0]?.text) {
@@ -314,6 +315,7 @@ app.get("/api/playlist-info", async (req, res) => {
 
         const thumbnail = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
 
+        addedIds.add(videoId);
         videos.push({
           id: videoId,
           title,
@@ -324,7 +326,7 @@ app.get("/api/playlist-info", async (req, res) => {
       } else if (obj.lockupViewModel) {
         const v = obj.lockupViewModel;
         const videoId = v.contentId;
-        if (videoId && v.contentType === "LOCKUP_CONTENT_TYPE_VIDEO") {
+        if (videoId && v.contentType === "LOCKUP_CONTENT_TYPE_VIDEO" && !addedIds.has(videoId)) {
           const title = v.metadata?.lockupMetadataViewModel?.title?.content || "Unknown Track";
           
           let duration = "0:00";
@@ -343,6 +345,7 @@ app.get("/api/playlist-info", async (req, res) => {
 
           const thumbnail = `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`;
 
+          addedIds.add(videoId);
           videos.push({
             id: videoId,
             title,
@@ -358,7 +361,64 @@ app.get("/api/playlist-info", async (req, res) => {
       }
     }
 
+    function findContinuationToken(obj: any): string | null {
+      if (!obj || typeof obj !== "object") return null;
+      if (obj.continuationItemRenderer) {
+        try {
+          return obj.continuationItemRenderer.continuationEndpoint.continuationCommand.token;
+        } catch (e) {
+          return null;
+        }
+      }
+      for (const key of Object.keys(obj)) {
+        const token = findContinuationToken(obj[key]);
+        if (token) return token;
+      }
+      return null;
+    }
+
     searchVideos(data);
+
+    // Extract InnerTube API key to load subsequent pages
+    const apiKeyMatch = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/) || html.match(/"apiKey"\s*:\s*"([^"]+)"/);
+    const apiKey = apiKeyMatch ? apiKeyMatch[1] : null;
+    let continuationToken = findContinuationToken(data);
+    let pageCount = 0;
+    const maxTracks = 500;
+
+    while (continuationToken && apiKey && videos.length < maxTracks && pageCount < 10) {
+      pageCount++;
+      try {
+        const browseUrl = `https://www.youtube.com/youtubei/v1/browse?key=${apiKey}`;
+        const browseResponse = await fetch(browseUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          },
+          body: JSON.stringify({
+            continuation: continuationToken,
+            context: {
+              client: {
+                clientName: "WEB",
+                clientVersion: "2.20240301.01.00"
+              }
+            }
+          })
+        });
+
+        if (!browseResponse.ok) {
+          break;
+        }
+
+        const browseData = await browseResponse.json();
+        searchVideos(browseData);
+        continuationToken = findContinuationToken(browseData);
+      } catch (err) {
+        console.error("Error loading playlist continuation:", err);
+        break;
+      }
+    }
 
     let playlistTitle = "YouTube Playlist";
     const metaTitle = html.match(/<meta\s+name="title"\s+content="([^"]+)"/i) || html.match(/<title>([^<]+)<\/title>/i);
